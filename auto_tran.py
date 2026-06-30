@@ -1,409 +1,773 @@
-import subprocess
-import sys
-import os
-import re
-import time
-import json
-import os
-import re
-import yaml
-import requests
+import subprocess, sys, os, re, time, json, yaml, requests, shutil
 from pathlib import Path
-def write_trans_log(log_path, filename, status, original=None, response=None):
-    """在工作目录下记录翻译日志以便 Debug"""
+import pandas as pd
+import numpy as np
+from sentence_transformers import SentenceTransformer
+import faiss
+import hashlib
+import json
+import numpy as np
+from pathlib import Path
+from datetime import datetime
+
+
+# ================================================================
+# 1. 物理路径锁定 (确保脚本在任何地方运行都能找到配置文件)
+# ================================================================
+SCRIPT_PATH = Path(__file__).resolve()
+PROJECT_ROOT = SCRIPT_PATH.parent 
+
+# 统一使用绝对路径
+CONFIG_DIR = PROJECT_ROOT / "config"
+PARAM_JSON = PROJECT_ROOT / "examples" / "custom_api_params.json"
+CURRENT_LOG_FILE = None
+API_URL = "http://127.0.0.1:8080/v1/chat/completions"
+
+
+
+def log_llm_transaction(log_path, filename, payload, response_data):
     timestamp = time.strftime("%Y-%m-%d %H:%M:%S")
     with open(log_path, "a", encoding="utf-8") as f:
-        f.write(f"[{timestamp}] 文件: {filename} | 状态: {status}\n")
-        if original:
-            f.write(f"--- 原文 Chunks ---\n{original}\n")
-        if response:
-            f.write(f"--- LLM 原始响应 ---\n{response}\n")
-        f.write("-" * 50 + "\n")
-def run_mtu_command(image_path, lang_type="JP"):
-    """
-    运行 MTU 的 CLI 命令
-    使用 sys.executable 确保调用的是当前 venv 的 python
-    """
-    # 构造命令列表，使用列表方式传参最安全，自动处理空格和引号
-    match = re.match(r'^(.*)\\[^\\]+$', image_path)
-    if match:
-        out_path = match.group(1)
-    if lang_type == "JP":
-        config_dir = r"config\config_save_text_jp.json"
-    elif lang_type == "CN":
-        config_dir = r"config\config_save_text_cn.json"
-    else:
-        config_dir = r"config\config_save_text_en.json"
-    cmd = [sys.executable, "-m", "manga_translator", "--config", config_dir, "-i", image_path, "-o", out_path , "--overwrite"]
-    
-    # 定义工作目录（确保路径正确）
-    # 如果你的图片在 C:\pics，这里可以传该路径
-    working_dir = os.path.dirname(os.path.abspath(image_path))
-    
-    print(f"正在执行: {' '.join(cmd)}")
-    
-    # 执行命令
-    # capture_output=True 可以捕获日志，方便调试
-    # text=True 让输出直接显示为字符串而不是字节流
-    result = subprocess.run(
-        cmd, 
-        capture_output=True, 
-        text=True,
-        encoding='utf-8' 
-    )
-    
-    if result.returncode == 0:
-        print("✅ 命令执行成功！")
-        print(result.stdout)
-    else:
-        print("❌ 命令执行失败！")
-        print("错误信息:", result.stderr)
+        f.write(f"\n{'='*30} BEGIN LLM TRANSACTION ({timestamp}) {'='*30}\n")
+        f.write(f"FILE: {filename}\n")
+        f.write(">>> [REQUEST PAYLOAD]:\n")
+        f.write(json.dumps(payload, ensure_ascii=False, indent=4))
+        f.write("\n\n<<< [RESPONSE FROM LLM]:\n")
+        f.write(json.dumps(response_data, ensure_ascii=False, indent=4))
+        f.write(f"\n{'='*30} END TRANSACTION {'='*30}\n")
+
+# --- 新增日志函数：记录回写结果汇总 (tran_debug.log) ---
+def log_tran_summary(log_path, filename, final_data):
+    timestamp = time.strftime("%Y-%m-%d %H:%M:%S")
+    with open(log_path, "a", encoding="utf-8") as f:
+        f.write(f"[{timestamp}] 文件: {filename} 回写汇总:\n")
+        f.write(json.dumps(final_data, ensure_ascii=False, indent=4))
+        f.write("\n" + "-"*50 + "\n")
         
+def log_print(*args, **kwargs):
+    """
+    代替系统的 print 函数，同时输出到控制台和 print_debug.log
+    用法: log_print("message", var)
+    """
+    # 将所有参数转为字符串
+    msg = " ".join(map(str, args))
+    timestamp = time.strftime("%Y-%m-%d %H:%M:%S")
+    full_msg = f"[{timestamp}] {msg}"
+    
+    # 1. 依然在控制台打印 (保持实时可见)
+    print(full_msg, **kwargs)
+    
+    # 2. 写入文件
+    if CURRENT_LOG_FILE:
+        try:
+            with open(CURRENT_LOG_FILE, "a", encoding="utf-8") as f:
+                f.write(full_msg + "\n")
+        except: pass
+    
+log_print(f"--- 环境检查 ---")
+log_print(f"项目根目录: {PROJECT_ROOT}")
+log_print(f"配置目录: {CONFIG_DIR}")
+# 2. 核心清洗与解析逻辑
+# ================================================================
+import xgboost as xgb
+import re
+import numpy as np
+from pathlib import Path
+class MangaSentinel:
+    def __init__(self, regions, model_path=r'C:\pythonProject\manga-translator-ui-main\manga_xgb.txt'):
+        # 1. 严格锁定 BorutaShap 筛选后的 16 个特征顺序
+        self.feature_names = [
+            'font_size_to_max_ratio', 'hira_ratio', 'punct_ratio', 'norm_y', 
+            'size_prob_prod', 'digit_ratio', 'kata_ratio', 'color_diff', 
+            'aspect_ratio', 'prob_zscore', 'angle', 'prob', 
+            'emotion_ratio', 'alpha_numeric_ratio', 'dist_to_edge', 'ratio_color_prod'
+        ]
+        
+        # 2. 加载模型
+        self.model = xgb.Booster()
+        self.model.load_model(str(model_path))
+        
+        # 3. 预计算当前页面的统计基准（消除拍脑袋阈值）
+        self.pg_stats = self._calc_page_stats(regions)
+
+    def _calc_page_stats(self, regions):
+        """计算全页统计量，用于生成相对特征 (Z-Score, MaxRatio)"""
+        if not regions: return {}
+        
+        probs = [r.get('prob', 0) for r in regions]
+        sizes = [r.get('font_size', 0) for r in regions]
+        
+        return {
+            'prob_mean': np.mean(probs),
+            'prob_std': np.std(probs) if len(probs) > 1 else 0.1,
+            'font_size_max': max(sizes) if sizes else 1,
+            'total_count': len(regions)
+        }
+
+    def _get_char_stats(self, text):
+        """镜像训练脚本中的 V6.6/V6.7 语言学指纹逻辑"""
+        text = str(text)
+        t_len = len(text) if len(text) > 0 else 1
+        
+        # 1. 平假名
+        hira = len(re.findall(r'[\u3040-\u309f]', text))
+        # 2. 片假名 (含扩展)
+        kata = len(re.findall(r'[\u30a0-\u30ff\u31f0-\u31ff]', text))
+        # 3. 汉字
+        han = len(re.findall(r'[\u4e00-\u9fa5\u3400-\u4dbf]', text))
+        # 4. 数字 (全半角)
+        digits = len(re.findall(r'[0-9\uff10-\uff19]', text))
+        # 5. 拉丁字母 (全半角)
+        latin = len(re.findall(r'[a-zA-Z\uff21-\uff3a\uff41-\uff5a]', text))
+        # 6. 人类标点 (全半角)
+        punct_pattern = r'[!?. , :;()\[\]{}\uff01\uff1f\u3002\u3001\uff0c\uff1a\uff1b\u300c\u300d\u300e\u300f\uff08\uff09\u3010\u3011\u2026\u2014\u2015\u00b7\u30fb\u2022\u301c\u30fc-]'
+        punct = len(re.findall(punct_pattern, text))
+        # 7. 情绪符号
+        emotions = len(re.findall(r'[\u2600-\u26ff\u2700-\u27bf\U0001f300-\U0001f6ff]', text))
+
+        return {
+            'len': t_len,
+            'hira': hira / t_len,
+            'kata': kata / t_len,
+            'digit': digits / t_len,
+            'latin': latin / t_len,
+            'punct': punct / t_len,
+            'emotion': emotions / t_len,
+            'alpha_numeric': (digits + latin) / t_len
+        }
+
+    def predict_is_noise(self, reg, upscale, pg_w, pg_h):
+        """执行推理判断"""
+        if not reg: return False, 0.0
+        
+        text = str(reg.get('text', '')).strip()
+        c = self._get_char_stats(text)
+        
+        # 提取基础物理值
+        prob = reg.get('prob', 0)
+        size = reg.get('font_size', 0)
+        angle = abs(reg.get('angle', 0))
+        center = reg.get('center', [0, 0])
+        
+        # 颜色对比度
+        fg, bg = reg.get('fg_colors', [0,0,0]), reg.get('bg_colors', [255,255,255])
+        color_diff = sum(abs(fg[i] - bg[i]) for i in range(3))
+        
+        # 归一化坐标 (0-1)
+        norm_x = center[0] / (pg_w * upscale + 1e-6)
+        norm_y = center[1] / (pg_h * upscale + 1e-6)
+        dist_to_edge = min(norm_x, 1 - norm_x, norm_y, 1 - norm_y)
+
+        # 核心：计算那 16 个被选中的特征
+        feat_dict = {
+            'font_size_to_max_ratio': size / (self.pg_stats['font_size_max'] + 1e-6),
+            'hira_ratio': c['hira'],
+            'punct_ratio': c['punct'],
+            'norm_y': norm_y,
+            'size_prob_prod': size * prob,
+            'digit_ratio': c['digit'],
+            'kata_ratio': c['kata'],
+            'color_diff': color_diff,
+            'aspect_ratio': c['len'] / (len(reg.get('lines', [])) + 1e-6),
+            'prob_zscore': (prob - self.pg_stats['prob_mean']) / (self.pg_stats['prob_std'] + 1e-6),
+            'angle': angle,
+            'prob': prob,
+            'emotion_ratio': c['emotion'],
+            'alpha_numeric_ratio': c['alpha_numeric'],
+            'dist_to_edge': dist_to_edge,
+            'ratio_color_prod': (size / c['len']) / (color_diff + 1)
+        }
+
+        # 构造输入矩阵 (必须保证顺序与 self.feature_names 一致)
+        X_input = np.array([[feat_dict[f] for f in self.feature_names]], dtype=np.float32)
+        dmatrix = xgb.DMatrix(X_input, feature_names=self.feature_names)
+        
+        # 执行预测
+        p_noise = self.model.predict(dmatrix)[0]
+        
+        # 审计日志：只记录高危疑似噪声
+        if p_noise > 0.4:
+            # 这里的 print 可以改为你的日志记录函数
+            print(f"🕵️ [XGB审计] '{text[:10]}' -> P_Noise={p_noise:.4f} | Angle={int(angle)} | Hira={c['hira']:.2f}")
+
+        # 判定标准：超过 0.5 认为噪声，建议在 auto_tran 中结合双阈值使用
+        return (p_noise >= 0.5), p_noise
+
+class MangaMemory:
+    def __init__(self, model, root_dir='tran_memory'):
+        self.model = model  # 外部传入 BGE-M3 模型
+        self.root_dir = Path(root_dir)
+        self.root_dir.mkdir(exist_ok=True)
+        
+        # 1. HNSW 索引：支持百万级 O(log N) 检索
+        self.dim = 1024
+        self.index_path = self.root_dir / "hnsw_vector.index"
+        self.db_path = self.root_dir / "kv_metadata.jsonl"
+        
+        # 2. 内存状态
+        self.data_store = []
+        self.hash_table = {} # {hash: index_id} 快速去重
+        
+        self._init_db()
+
+    def _normalize(self, text):
+        """借鉴点：归一化逻辑"""
+        import unicodedata
+        # 转全角为半角/标准化，去空格，转小写
+        text = unicodedata.normalize('NFKC', text)
+        text = "".join(text.split())
+        return text.lower()
+
+    def _init_db(self):
+        # 初始化 HNSW 索引 (M=32 是工业标准参数)
+        if self.index_path.exists():
+            self.index = faiss.read_index(str(self.index_path))
+        else:
+            self.index = faiss.IndexHNSWFlat(self.dim, 32)
+            self.index.hnsw.efConstruction = 40  # 构件精度
+            
+        # 加载元数据
+        if self.db_path.exists():
+            with open(self.db_path, 'r', encoding='utf-8-sig') as f:
+                for idx, line in enumerate(f):
+                    item = json.loads(line)
+                    self.data_store.append(item)
+                    norm_text = self._normalize(item['orig'])
+                    self.hash_table[hashlib.md5(norm_text.encode()).hexdigest()] = idx
+
+    def search_and_prepare(self, query_text, threshold=0.85):
+        """翻译前：1. 归一化 2. 检索 3. 返回最高相似度(用于后续去重判断)"""
+        norm_query = self._normalize(query_text)
+        query_vec = self.model.encode([norm_query], normalize_embeddings=True)
+        
+        if self.index.ntotal == 0:
+            return "", 0.0, query_vec
+
+        distances, indices = self.index.search(np.array(query_vec).astype('float32'), 3)
+        
+        best_score = distances[0][0] if len(distances[0]) > 0 else 0
+        refs = []
+        for dist, idx in zip(distances[0], indices[0]):
+            if idx != -1 and dist > threshold:
+                item = self.data_store[idx]
+                refs.append(f"原文: {item['orig']} -> 译文: {item['trans']}")
+        
+        context = "\n[参考记忆]:\n" + "\n".join(refs) if refs else ""
+        return context, best_score, query_vec
+
+    def add_memory(self, original, translated, best_score, query_vec):
+        """翻译后：利用 search 阶段拿到的 best_score 智能决定是否写入"""
+        # 1. 物理去重：Hash 检查
+        norm_text = self._normalize(original)
+        h = hashlib.md5(norm_text.encode()).hexdigest()
+        if h in self.hash_table:
+            # 更新逻辑：可以在这里更新 item 的 count 和 last_seen
+            return 
+        
+        # 2. 语义去重：如果 search 时发现相似度已经 > 0.98，就不写了
+        if best_score > 0.98:
+            return
+
+        # 3. 写入索引与元数据
+        idx_id = self.index.ntotal
+        self.index.add(np.array(query_vec).astype('float32'))
+        
+        item = {
+            "orig": original,
+            "trans": translated,
+            "count": 1,
+            "last_seen": datetime.now().isoformat()
+        }
+        
+        with open(self.db_path, 'a', encoding='utf-8') as f:
+            f.write(json.dumps(item, ensure_ascii=False) + "\n")
+            
+        self.data_store.append(item)
+        self.hash_table[h] = idx_id
+        
+        # 4. 定期持久化索引 (由于 HNSW 写入很快，可以每 100 条写一次)
+        if idx_id % 100 == 0:
+            faiss.write_index(self.index, str(self.index_path))
+
+def safe_clean_line(translated, original):
+    """
+    高级防护清洗：
+    1. 标点符号白名单对比 (原文没有的标点直接删)
+    2. 括号一致性检查 (原文没有成对括号，译文直接删)
+    3. 省略号标准化与标点压缩
+    """
+    res = translated.strip()
+    
+    # ==========================================
+    # 1. 括号一致性物理删除 (解决：翻译多了 () [] 【】)
+    # ==========================================
+    bracket_pairs = [('(', ')'), ('（', '）'), ('[', ']'), ('［', '］'), ('【', '】')]
+    for open_b, close_b in bracket_pairs:
+        # 如果原文里没有这种开口括号，但译文里有
+        if open_b not in original and open_b in res:
+            # 物理删除：连带括号内的内容一起删掉（通常里面是 A/user/剧情解释）
+            # [^\{close_b}]* 表示匹配到闭合括号为止
+            res = re.sub(f'\\{open_b}[^\\{close_b}]*\\{close_b}', '', res)
+            # 如果只剩下了单边括号，也清理掉
+            res = res.replace(open_b, "").replace(close_b, "")
+
+    # ==========================================
+    # 2. 斩首逻辑 (保持高效切断)
+    # ==========================================
+    res = re.split(r'」。?\s*——', res)[0] 
+    res = re.split(r'」\s*——', res)[0]
+    res = re.sub(r'」\s*[「（\[].*$', '」', res)
+
+    # ==========================================
+    # 3. 标点符号过滤：只保留原文中出现过的标点类型
+    # ==========================================
+    # 定义所有可能的标点
+    full_punct_set = r'！!？?。，,、~～〜\-—=」』》>「『《<]'
+    # 提取原文中存在的标点字符集
+    orig_puncts = set(re.findall(f'[{full_punct_set}]', original))
+    # 宽容性补丁：允许翻译中正常增加 句号、逗号、感叹号、问号
+    orig_puncts.update(['。', '，']) 
+    
+    # 如果译文中出现了原文没有且不在宽容补丁里的标点，直接删掉
+    def punct_filter(match):
+        p = match.group(0)
+        return p if p in orig_puncts else ""
+    
+    res = re.sub(f'[{full_punct_set}]', punct_filter, res)
+
+    # ==========================================
+    # 4. 省略号标准化 (解决：........)
+    # ==========================================
+    # 将 3 个以上的连续点、或 2 个以上的连续句号统一转为标准省略号
+    res = re.sub(r'\.{3,}', '……', res)
+    res = re.sub(r'。{2,}', '……', res)
+    # 限制省略号最多只出现一个 (即：……)
+    res = re.sub(r'（……）{2,}', '……', res)
+
+    # ==========================================
+    # 5. 全局标点压缩 (≥3 压成 2)
+    # ==========================================
+    punct_limit_set = r'！!？?。，,、~～〜\-—=」』》>「『《<]'
+    res = re.sub(f'([{punct_limit_set}]{{3,}})', lambda m: m.group(1)[:2], res)
+
+    # 6. 特殊平衡清理：如果没有左引号，删掉右引号
+    if '「' not in res and res.endswith('」'):
+        res = res[:-1]
+    
+    return res.strip()
+def parse_textarea_output(raw_output, expected_keys, v_chunk_data):
+    """
+    V2.2.1 物理锚点解析器
+    """
+    # 1. 提取 <textarea> 标签内容
+    content_match = re.search(r'<textarea>(.*?)</textarea>', raw_output, re.DOTALL)
+    text_content = (content_match.group(1).strip() if content_match else raw_output.strip()).replace('\ufffd', '')
+    
+    # 2. 全局归一化：将所有可能的数字变体（包括 〇）映射为标准 0-9
+    # 同时将各种全角括号映射为半角，方便下一步正则处理
+    text_content = text_content.translate(str.maketrans(
+        "０１２３４５６７８９〇", 
+        "01234567890"
+    ))
+
+    # 3. 统一括号格式至标准 【N】
+    # 正则解释：
+    # [\[\(\<...]: 匹配任何类型的开口括号
+    # \s*(\d+)\s*?: 匹配数字，允许数字前后有空格
+    # \.?\s*: 允许数字后面带个点（LLM 习惯），如 【1.】
+    # [\]\)\>...]: 匹配任何类型的闭合括号
+    text_content = re.sub(r'[\[\(\<〈［（＜]\s*(\d+)\s*\.?\s*[\]\)\>〉］）＞]', r'【\1】', text_content)
+    
+    # 针对已经是 【】 格式但内部有空格或点的情况进行二次纠偏
+    text_content = re.sub(r'【\s*(\d+)\s*\.?\s*】', r'【\1】', text_content)
+
+    # 4. 基于【数字】标签提取
+    matches = re.findall(r'【(\d+)】\s*(.*?)(?=【\d+】|$)', text_content, re.DOTALL)
+    trans_map = {m[0]: m[1].strip() for m in matches if m[1].strip()}
+    # 5.在提取成 Map 时，立刻应用安全清洗
+    expected_count = len(expected_keys)
+    
+    trans_map = {}
+    for m_id, m_text in matches:
+        original_text = v_chunk_data.get(m_id, "") # 获取该序号对应的原文
+        trans_map[m_id] = safe_clean_line(m_text, original_text)
+    final_map = {}
+
+    # --- 情况 A：发现了标签 ---
+    if len(trans_map) > 0:
+        found_ids = [m[0] for m in matches]
+        found_texts = [m[1].strip() for m in matches]
+        
+        # 序号偏移纠偏 (如模型吐出 104, 105...)
+        is_wrong_numbering = not any(idx in expected_keys for idx in found_ids)
+        if is_wrong_numbering and len(found_texts) == expected_count:
+            for i, k in enumerate(expected_keys):
+                final_map[k] = found_texts[i]
+        else:
+            # 精准 ID 匹配
+            for k in expected_keys:
+                # 修正点：使用参数名 v_chunk_data 确保回退原文成功
+                final_map[k] = trans_map.get(k, v_chunk_data[k])
+        return final_map
+
+    # --- 情况 B：模型吞了标签，按物理行对齐 ---
+    raw_lines = [l.strip() for l in text_content.split('\n') if l.strip()]
+    valid_lines = [l for l in raw_lines if "翻译" not in l and "Translation" not in l]
+    
+    for i, k in enumerate(expected_keys):
+        if i < len(valid_lines):
+            # 移除行首残留符号
+            clean_line = re.sub(r'^\d+[\.、：:\s]*', '', valid_lines[i])
+            final_map[k] = clean_line
+        else:
+            final_map[k] = v_chunk_data[k] # 修正点：使用参数名 v_chunk_data
+            
+    return final_map
+
+def clean_translation_prefix(text, original_id):
+    """支持清洗 【1】 这种新格式的前缀，以及物理清理 Emoji 审计标记"""
+    # 1. 清洗物理 ID 前缀
+    prefixes = [f"【{original_id}】", f"[{original_id}]", f"{original_id}.", f"{original_id}．"]
+    res = text.strip()
+    for p in prefixes:
+        if res.startswith(p): 
+            res = res[len(p):].strip()
+    zombie_tags = [
+        r'\s*user$', r'\s*assistant$', 
+        r'\s*Input:$', r'\s*Output:$', r'\s*user\\n$'
+    ]
+    for tag_pattern in zombie_tags:
+        res = re.sub(tag_pattern, '', res, flags=re.IGNORECASE)
+    # 2. 清洗 Emoji 审计标记 (⚠️)
+    # 使用正则清理行首可能残留的特殊 Emoji 符号
+    res = re.sub(r'^[⚠️]+', '', res).strip()
+    return res
+
+# ================================================================
+# 3. 翻译流水线 (回退到 TextArea 模式)
+# ================================================================
+# --- 辅助函数：切分字典 ---
+def chunk_dict(data, size):
+    """
+    最稳健的切分函数：将字典转换为列表项后进行切片
+    """
+    items = list(data.items()) # 转换为 [(k1, v1), (k2, v2)...]
+    for i in range(0, len(items), size):
+        # 将切片后的列表重新转回字典返回
+        yield dict(items[i:i + size])
+        
+def translate_pipeline(target_dir, lang_type="JP", memory=None, max_lines=10, char_limit=50, prob_threshold=0.4):
+    global CURRENT_LOG_FILE
+    work_dir = Path(target_dir).parent
+    llm_log_path = work_dir / "llm_debug.log"
+    tran_log_path = work_dir / "tran_debug.log"
+    CURRENT_LOG_FILE = work_dir / "print_debug.log"
+    json_dir = work_dir / "json" 
+    params = json.load(open(PARAM_JSON, 'r'))['translator'] if PARAM_JSON.exists() else {}
+    prompt_map = {
+    "JP": "prompt_jp_sakura.yaml",
+    "EN": "prompt_en.yaml",
+    "CN": "prompt_cn.yaml",
+}
+    prompt_file = prompt_map.get(lang_type.upper(), "prompt_cn.yaml")
+    log_print("🚀 正在加载 BGE-M3 语义记忆模型...")
+
+    with open(CONFIG_DIR / prompt_file, 'r', encoding='utf-8') as f:
+        sys_prompt = yaml.safe_load(f)['system_prompt'].replace('{target_language}', '简体中文').replace('{{{target_lang}}}', '简体中文')
+
+    for txt_file in sorted(Path(target_dir).glob("*.txt")):
+        if not txt_file.exists() or txt_file.stat().st_size == 0:
+            log_print(f"⏩ 跳过空文件 (无OCR内容): {txt_file.name}")
+            continue
+        log_print(f"\n正在处理: {txt_file.name}")
+        
+        # --- Stage 1.1: 载入 prob 审计数据 ---
+        meta_map = {}
+        json_filename = txt_file.name.replace("_original.txt", "_translations.json")
+        json_meta_path = json_dir / json_filename
+        # 存储这一页中第几个 region 是噪音，例如 {0, 3, 5}
+        purge_indices = set() 
+        all_regions = []
+        upscale, pg_w, pg_h = 1, 1, 1
+        if json_meta_path.exists():
+            try:
+                with open(json_meta_path, 'r', encoding='utf-8') as jf:
+                    m_data = json.load(jf)
+                    img_node = m_data[list(m_data.keys())[0]]
+                    all_regions = img_node.get('regions', [])
+                    pg_w, pg_h = img_node.get('original_width', 1), img_node.get('original_height', 1)
+                    upscale = img_node.get('upscale_ratio', 1)
+                    for reg in all_regions:
+                        for t_line in reg.get('texts', []):
+                            meta_map[str(t_line).strip()] = reg
+            except Exception as e:
+                log_print(f"   ❌ 读取 JSON 审计失败: {e}")
+        else:
+            log_print(f"   ⚠️ 未找到审计文件: {json_meta_path} (请检查文件夹是否存在)")
+        
+        try:
+            with open(txt_file, 'r', encoding='utf-8') as f:
+                content = f.read().strip()
+                
+            if not content:
+                log_print(f"⏩ 跳过空文件: {txt_file.name}")
+                continue
+                
+            # 注意这里是 loads (带s)，解析刚才读出来的 content 字符串
+            data = json.loads(content)
+            
+        except json.JSONDecodeError as e:
+            log_print(f"❌ 文件 {txt_file.name} 内容不是合法的 JSON (可能含有非法反斜杠或残缺): {e}")
+            log_print(f"💡 跳过此文件，继续处理下一个...")
+            continue
+        except Exception as e:
+            log_print(f"❌ 读取 {txt_file.name} 发生未知错误: {e}")
+            continue
+        sentinel = MangaSentinel(all_regions)
+        items = list(data.items())
+        full_translated_page = {}
+        valid_items_to_send = []
+        # 建立一个记录“哪些 Region ID 需要被物理删除”的集合
+        regions_to_purge = set()
+        for idx, reg in enumerate(all_regions):
+            # 获取该 region 对应的 texts（可能是多行）
+            texts_list = reg.get('texts', [])
+            is_noise_region = False
+            
+            # 使用模型判定
+            if lang_type != "CN":
+                is_noise, p_val = sentinel.predict_is_noise(reg, upscale, pg_w, pg_h)
+                
+                if is_noise:
+                    purge_indices.add(idx)
+                    regions_to_purge.add(id(reg))
+                    # 记录这块区域下所有的 texts 都标记为不翻译
+                    for t in texts_list:
+                        full_translated_page[str(t).strip()] = str(t)
+                    log_print(f"   🚫 [XGB旁路] Prob={p_val:.4f} | 内容='{reg.get('text')[:10]}'")
+
+        for real_key, val in items:
+            t_key = str(real_key).strip()
+            reg_meta = meta_map.get(t_key)
+            # 如果该行所属的 Region 在拦截名单里
+            if reg_meta and id(reg_meta) in regions_to_purge:
+                full_translated_page[real_key] = real_key # 回填原文
+            else:
+                valid_items_to_send.append((real_key, val)) # 只有这里才是 LLM
+        # 2. 动态切块翻译
+        chunks = []
+        temp_chunk = []
+        if valid_items_to_send:
+            for item in valid_items_to_send:
+                val_len = len(item[1]) if lang_type == "JP" else len(item[1].split())
+                if val_len > char_limit or len(temp_chunk) >= max_lines:
+                    if temp_chunk: chunks.append(temp_chunk)
+                    chunks.append([item]); temp_chunk = []
+                else:
+                    temp_chunk.append(item)
+            if temp_chunk: chunks.append(temp_chunk)
+
+        # 跑 API 翻译
+        # 跑 API 翻译
+        if lang_type != "CN":
+            for raw_chunk in chunks:
+                # ================================================================
+                # 调用位置 A: 检索增强 (RAG Prepare)
+                # ================================================================
+                raw_refs = []
+                chunk_rag_info = {} # 用于暂存向量，防止重复计算
+                
+                for idx, (real_key, original_val) in enumerate(raw_chunk):
+                    # 修改 search_and_prepare，让它只返回具体的 "原文 -> 译文" 对，不要带标题
+                    # 或者在这里手动处理字符串
+                    context, score, vec = memory.search_and_prepare(original_val)
+                    if context:
+                        # 提取具体的 "原文: ... -> 译文: ..." 部分
+                        clean_ref = context.replace("[参考记忆]:", "").strip()
+                        raw_refs.append(clean_ref)
+                    chunk_rag_info[str(idx+1)] = {"vec": vec, "score": score}
+                
+                # 合并成一个整洁的参考块
+                if raw_refs:
+                    unique_refs = list(set(raw_refs))
+                    rag_prompt_addition = "\n\n【相关历史译文参考】:\n" + "\n".join(unique_refs)
+                else:
+                    rag_prompt_addition = ""
+                
+                current_sys_prompt = sys_prompt + rag_prompt_addition
+                # ================================================================
+
+                v_chunk_data = {str(idx+1): val for idx, (key, val) in enumerate(raw_chunk)}
+                v_input = "\n".join([f"【{k}】{v}" for k, v in v_chunk_data.items()])
+                expected_count = len(raw_chunk)
+                line_rules = []
+                line_refs = []
+                for i in range(1, expected_count + 1):
+                    # 关键：严格限制每行开头为【序号】，中间非换行，结尾必须换行
+                    line_rules.append(f'line{i} ::= "【{i}】" [^\\n]+ "\\n"')
+                    line_refs.append(f"line{i}")
+                
+                gbnf_rules = [f'root ::= "<textarea>\\n" {" ".join(line_refs)} "</textarea>"']
+                gbnf_rules.extend(line_rules)
+                gbnf_code = "\n".join(gbnf_rules) 
+                try:
+                    # 每一块都是独立请求，防止 Session 污染
+                    payload = {
+                        "model": "local-model",
+                        "messages": [
+                            {"role": "system", "content": current_sys_prompt}, # 使用 RAG 增强后的提示词
+                            {"role": "user", "content": v_input}
+                        ],
+                        "grammar": gbnf_code,  # 核心：物理锁死格式
+                        "stop": ["</textarea>","<|im_end|>","<|endoftext|>"],
+                        **params
+                    }
+                    
+                    r = requests.post(API_URL, json=payload, timeout=120).json()
+                    log_llm_transaction(llm_log_path, txt_file.name, payload, r)
+                    
+                    raw_response = r['choices'][0]['message']['content']
+                    # 解析虚拟 ID 的结果
+                    v_trans_res = parse_textarea_output(raw_response, list(v_chunk_data.keys()), v_chunk_data)
+                    
+                    # 核心：通过索引 idx 将虚拟 ID 映射回真正的原始 Key
+                    for idx, (real_key, original_val) in enumerate(raw_chunk):
+                        v_id = str(idx + 1)
+                        translated_text = v_trans_res.get(v_id, original_val)
+                        
+                        # 得到最终清洗后的译文
+                        final_trans = clean_translation_prefix(translated_text, v_id)
+                        full_translated_page[real_key] = final_trans
+                        
+                        # ================================================================
+                        # 调用位置 B: 增量写入记忆库 (RAG Store)
+                        # ================================================================
+                        # 只有翻译成功（不为空且不等于原文）才写入
+                        if final_trans and final_trans != original_val:
+                            info = chunk_rag_info.get(v_id)
+                            if info:
+                                memory.add_memory(
+                                    original=original_val, 
+                                    translated=final_trans, 
+                                    best_score=info["score"], 
+                                    query_vec=info["vec"]
+                                )
+                        # ================================================================
+                        
+                except Exception as e:
+                    log_print(f"   ⚠️ 块处理失败 ({e})，保留原文")
+                    for r_key, r_val in raw_chunk:      
+                        full_translated_page[r_key] = r_val
+        else:
+            for raw_chunk in chunks:
+                for r_key, r_val in raw_chunk:      
+                    full_translated_page[r_key] = r_val
+        # 记录汇总并写回文件
+        log_tran_summary(tran_log_path, txt_file.name, full_translated_page)
+        with open(txt_file, 'w', encoding='utf-8') as f:
+            json.dump(full_translated_page, f, ensure_ascii=False, indent=4)
+        log_print(f"✅ {txt_file.name} 翻译成功并回写")
+         # 5. --- [核心调用：物理切除 JSON 噪音并重置蒙版] ---
+
+
+# ================================================================
+# 4. MTU 与坐标修复 (保持稳定版逻辑)
+# ================================================================
+
 def fix_and_scale_json(json_path):
-    """
-    物理降维打击：将 2x 坐标转换为 1x，彻底解决嵌字空白问题
-    """
-    if not os.path.exists(json_path):
-        print(f"跳过：找不到JSON文件 {json_path}")
-        return
-
-    with open(json_path, 'r', encoding='utf-8') as f:
-        data = json.load(f)
-
+    if not os.path.exists(json_path) or os.path.getsize(json_path) == 0: return
+    try:
+        with open(json_path, 'r', encoding='utf-8') as f:
+            data = json.load(f)
+    except:
+        return # 如果 JSON 损坏则跳过
     for img_key in data:
         img_data = data[img_key]
-        # 核心逻辑：只有 upscale_ratio 为 2 时才执行
         if img_data.get('upscale_ratio') == 2:
-            print(f"检测到超分数据: {os.path.basename(img_key)}，正在进行坐标放缩...")
-            
+            log_print(f"降维处理: {os.path.basename(json_path)}")
             for reg in img_data.get('regions', []):
-                # 1. 缩放中心点
-                reg['center'] = [c / 2 for c in reg['center']]
-                
-                # 2. 缩放文本行坐标点 (四角坐标)
+                reg['center'] = [int(c / 2) for c in reg['center']]
                 if 'lines' in reg:
                     new_lines = []
                     for line in reg['lines']:
-                        new_lines.append([[p[0]/2, p[1]/2] for p in line])
+                        new_line = [[int(p[0]/2), int(p[1]/2)] for p in line]
+                        if len(new_line) >= 3: # 只有有效的多边形才保留
+                            new_lines.append(new_line)
                     reg['lines'] = new_lines
-                
-                # 3. 缩放字体大小 (非常关键，否则字会巨大)
                 reg['font_size'] = max(12, int(reg['font_size'] / 2))
-                
-                # 4. 清理翻译内容中的标识（双重保险）
-                if reg.get('translation'):
-                    reg['translation'] = clean_llm_text(reg['translation'])
-
-            # 5. 修正元数据：告诉 MTU 渲染器现在已经是 1x 空间了
             img_data['upscale_ratio'] = 1
-            
     with open(json_path, 'w', encoding='utf-8') as f:
         json.dump(data, f, ensure_ascii=False, indent=4)
-    print(f"✅ 坐标放缩完成！")
 
-
-# --- 1. 基础配置与路径 ---
-CONFIG_DIR = Path(r".\config")
-PARAM_JSON = Path(r"examples/custom_api_params.json")
-API_URL = "http://127.0.0.1:8080/v1/chat/completions" # 根据您的模型后端调整
-
-# --- 2. 核心清洗函数 (并集优化版) ---
-
-def natural_sort_key(s):
-    """文件名自然排序: 1.txt < 2.txt < 10.txt"""
-    return [int(text) if text.isdigit() else text.lower() for text in re.split(r'(\d+)', str(s))]
-
-def clean_mtu_json_text(content):
-    """
-    清洗MTU导出的txt内容，使其符合标准JSON格式
-    并集处理：修复非法转义、修复行内双引号
-    """
-    # 修复非法转义序列
-    content = re.sub(r'\\(?![ntrfb"\\/]|u[0-9a-fA-F]{4})', r'\\\\', content)
-    
-    # 修复行内非法双引号 (利用正则匹配 ID: "Text" 结构)
-    # 只保留 key 和 value 两侧的引号，中间的引号转为单引号
-    def fix_quotes(match):
-        key, val = match.groups()
-        val = val.replace('"', "'")
-        return f'"{key}": "{val}"'
-    
-    clean_content = re.sub(r'"(\d+)":\s*"(.*)"', fix_quotes, content)
-    return clean_content
-
-# --- 3. 文本分块与处理逻辑 ---
-
-def chunk_text_dict(text_dict, max_lines=30):
-    """将大字典切分为小块，防止LLM疲劳"""
-    items = list(text_dict.items())
-    for i in range(0, len(items), max_lines):
-        yield dict(items[i:i + max_lines])
-
-def load_prompt(lang_type):
-    file_name = "prompt_jp_sakura.yaml" if lang_type == "JP" else "prompt_en.yaml"
-    path = CONFIG_DIR / file_name
-    if not path.exists(): return ""
-    
-    with open(path, 'r', encoding='utf-8') as f:
-        data = yaml.safe_load(f)
-    
-    system_prompt = data.get('system_prompt', '')
-    
-    # 彻底替换所有可能的占位符
-    target_lang = "简体中文"
-    source_lang = "日语" if lang_type == "JP" else "英语"
-    
-    system_prompt = system_prompt.replace('{target_language}', target_lang)
-    system_prompt = system_prompt.replace('{{{target_lang}}}', target_lang)
-    system_prompt = system_prompt.replace('{source_language}', source_lang)
-    
-    return system_prompt
-
-def load_llm_params():
-    """加载API参数"""
-    if PARAM_JSON.exists():
-        try:
-            with open(PARAM_JSON, 'r', encoding='utf-8') as f:
-                return json.load(f).get('translator', {})
-        except Exception as e:
-            print(f"加载API参数失败: {e}")
-    return {"temperature": 0.3, "top_p": 0.8, "max_tokens": 4096}
-
-def call_local_llm_with_retry(system_prompt, user_input, params, max_retries=3):
-    """带重试机制的本地LLM调用"""
-    for attempt in range(max_retries):
-        print(f"\n尝试第 {attempt + 1} 次翻译请求...")
+ 
         
-        if attempt > 0:
-            print("等待2秒后重试...")
-            import time
-            time.sleep(2)
-        
-        try:
-            result = call_local_llm(system_prompt, user_input, params)
-            if result and not result.startswith("[MISSING]"):
-                print(f"第 {attempt + 1} 次尝试成功")
-                return result
-            else:
-                print(f"第 {attempt + 1} 次尝试失败，结果为空或无效")
-                if attempt == max_retries - 1:
-                    return None
-        except Exception as e:
-            print(f"第 {attempt + 1} 次尝试异常: {e}")
-            if attempt == max_retries - 1:
-                return None
+def run_mtu_command(image_path, lang_type="JP"):
     
-    return None
+    if lang_type == "JP" :
+        config_file = "config_save_text_jp.json" 
+    elif lang_type == "CN":
+        config_file = "config_save_text_cn.json"
+    else:
+        config_file = "config_save_text_en.json"
+    config_path = CONFIG_DIR / config_file
+    out_path = Path(image_path).resolve().parent
+    cmd = [sys.executable, "-m", "manga_translator", "--config", str(config_path), "-i", str(image_path), "-o", str(out_path), "--overwrite"]
+    subprocess.run(cmd, cwd=str(PROJECT_ROOT), check=True)
 
-# --- 4. 翻译与对齐校验 ---
-
-def parse_llm_output(raw_output, original_keys):
-    """
-    解析 LLM 输出，支持多种格式并强制对齐
-    """
-    print(f"原始LLM输出: {raw_output}")
-    
-   # 1. 提取 <textarea> 内容
-    content_match = re.search(r'<textarea>(.*?)</textarea>', raw_output, re.DOTALL)
-    text_content = content_match.group(1).strip() if content_match else raw_output.strip()
-
-    # 2. 归一化处理：全角转半角 (针对数字、句号、冒号)
-    # 建立映射表：全角 0-9, 句号, 冒号, 间隔号
-    full_width = "０１２３４５６７８９．：・·"
-    half_width = "0123456789..::"
-    trans_table = str.maketrans(full_width, half_width)
-    normalized_content = text_content.translate(trans_table)
-
-    # 3. 增强版正则匹配
-    # 逻辑：行首数字 + (点/冒号/空格/间隔号中的任意个) + 译文
-    # 支持格式: "1. 译文", "1．译文", "1:译文", "1 译文", "1·译文"
-    pattern = re.compile(r'^\s*(\d+)\s*[:\.．：·・\s-]\s*(.*)$', re.MULTILINE)
-    matches = pattern.findall(normalized_content)
-    
-    # 4. 清洗翻译文本 (物理清除 Qwen 标识残留)
-    trans_map = {}
-    for m in matches:
-        val = m[1].strip()
-        # 清除 <|1|> 或 [1] 这种标识
-        val = re.sub(r'^[<|\|\[\]\s>]+', '', val)
-        val = re.sub(r'[<|\|\[\]\s>]+$', '', val)
-        trans_map[m[0]] = val
-
-    print(f"解析结果 (前3项): {list(trans_map.items())[:3]}")
-
-    # 5. 强制映射校验
-    final_map = {}
-    missing_count = 0
-    for k in original_keys:
-        if k in trans_map:
-            final_map[k] = trans_map[k]
-        else:
-            final_map[k] = "[MISSING]"
-            missing_count += 1
-    
-    if missing_count > 0:
-        print(f"⚠️ 警告：该页有 {missing_count} 行匹配失败，请检查归一化逻辑。")
-
-    
-    print(f"最终翻译映射: {final_map}")
-    return final_map
-
-def call_local_llm(system_prompt, user_input, params):
-    """调用本地 127.0.0.1 接口"""
-    payload = {
-        "model": "local-model",
-        "messages": [
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_input}
-        ],
-        **params
-    }
-    
-    print(f"发送API请求到: {API_URL}")
-    # print(f"请求参数: {payload}")
-    
-    try:
-        response = requests.post(API_URL, json=payload, timeout=120)
-        print(f"API响应状态码: {response.status_code}")
-        
-        if response.status_code != 200:
-            print(f"API请求失败，状态码: {response.status_code}")
-            print(f"响应内容: {response.text}")
-            return ""
-            
-        response_data = response.json()
-        print(f"API响应数据: {response_data}")
-        
-        if 'choices' not in response_data or len(response_data['choices']) == 0:
-            print("API响应中没有choices字段")
-            return ""
-            
-        if 'message' not in response_data['choices'][0]:
-            print("API响应中没有message字段")
-            return ""
-            
-        return response_data['choices'][0]['message']['content']
-        
-    except requests.exceptions.Timeout:
-        print("API请求超时")
-        return ""
-    except requests.exceptions.ConnectionError:
-        print("API连接失败，请检查本地LLM服务是否启动")
-        return ""
-    except json.JSONDecodeError as e:
-        print(f"API响应JSON解析失败: {e}")
-        print(f"响应内容: {response.text}")
-        return ""
-    except Exception as e:
-        print(f"API请求失败: {e}")
-        return ""
-
-# --- 5. 工程化回写逻辑 ---
-
-def save_translated_txt(file_path, translated_dict):
-    """以标准 JSON 格式写回原 TXT 文件"""
-    with open(file_path, 'w', encoding='utf-8') as f:
-        json.dump(translated_dict, f, ensure_ascii=False, indent=4)
-
-# --- 6. 主流程控制 ---
-
-def translate_pipeline(target_dir, lang_type="JP"):
-    work_dir = Path(target_dir).parent
-    debug_log = work_dir / "translation_debug.log"
-    
-    print(f"开始翻译，日志记录于: {debug_log}")
-    params = load_llm_params()
-    sys_prompt = load_prompt(lang_type)
-    txt_files = sorted(Path(target_dir).glob("*.txt"), key=natural_sort_key)
-    
-    for txt_file in txt_files:
-        print(f"\n处理文件: {txt_file.name}")
-        with open(txt_file, 'r', encoding='utf-8') as f:
-            data = json.load(f)
-
-        full_translated_page = {}
-        
-        # 1. 建立虚拟 ID 映射关系
-        # original_keys 将存储真正的 Key (如 "東京 17:30")
-        # llm_input_dict 将存储 { "1": "東京 17:30", "2": "私、大宮美奈子は" }
-        original_keys = list(data.keys())
-        llm_input_dict = {str(i+1): data[original_keys[i]] for i in range(len(original_keys))}
-
-        # 2. 分块翻译
-        for chunk in chunk_text_dict(llm_input_dict, max_lines=30):
-            # 现在的 user_input 绝对是 1.xxx 2.xxx
-            user_input = "\n".join([f"{k}.{v}" for k, v in chunk.items()])
-            
-            raw_response = call_local_llm_with_retry(sys_prompt, user_input, params)
-            
-            # 3. 解析 (注意现在 original_keys 传入的是虚拟数字 ID)
-            chunk_result = parse_llm_output(raw_response, chunk.keys())
-            
-            if chunk_result:
-                write_trans_log(debug_log, txt_file.name, "成功", user_input, raw_response)
-                # 4. 映射回原始的 Key
-                for virtual_id, translated_text in chunk_result.items():
-                    # 通过虚拟 ID 找到原始索引
-                    idx = int(virtual_id) - 1
-                    real_key = original_keys[idx]
-                    full_translated_page[real_key] = translated_text
-            else:
-                print(f"警告: {txt_file.name} 块翻译失败，已记录到 Log")
-                write_trans_log(debug_log, txt_file.name, "解析失败/幻觉", user_input, raw_response)
-                # 失败退避：将该块映射回原文
-                for virtual_id in chunk.keys():
-                    idx = int(virtual_id) - 1
-                    real_key = original_keys[idx]
-                    full_translated_page[real_key] = data[real_key]
-
-        # 5. 回写
-        save_translated_txt(txt_file, full_translated_page)
-        print(f"回写成功: {txt_file.name}")
-
-def run_render_stage(image_path, output_path, config_path=r"config\config_load_text.json"):
-    """
-    运行 MTU 渲染阶段
-    优化：使用时间戳和更专业的目录命名
-    """
-    
-    if output_path is None:
-        output_path = os.path.join(os.path.dirname(image_path), "rendered_results")
+def run_render_stage(image_path, output_path):
+    config_path = CONFIG_DIR / "config_load_text.json"
+    if os.path.exists(output_path): shutil.rmtree(output_path)
     os.makedirs(output_path, exist_ok=True)
-    cmd = [
-        sys.executable, "-m", "manga_translator", 
-        "local",
-        "--config", config_path,
-        "--input", image_path,
-        "--output", output_path
-    ]
-    
-    print(f"\n🚀 启动工程化渲染模式")
-    print(f"目标路径: {output_path}")
-    
-    try:
-        # 建议直接在终端看到实时输出，不要 capture_output，除非需要日志审计
-        result = subprocess.run(cmd, check=True)
-        if result.returncode == 0:
-            print(f"✅ 渲染成功！成品位于: {output_path}")
-    except Exception as e:
-        print(f"❌ 渲染执行异常: {e}")
-        
+    subprocess.run([sys.executable, "-m", "manga_translator", "local", "--config", str(config_path), "--input", str(image_path), "--output", str(output_path)], cwd=str(PROJECT_ROOT), check=True)
+    # 路径平铺
+    redundant_dir = Path(output_path) / Path(image_path).name
+    if redundant_dir.exists():
+        for item in redundant_dir.iterdir():
+            shutil.move(str(item), str(Path(output_path) / item.name))
+        redundant_dir.rmdir()
+
+# ================================================================
+# 5. 执行入口
+# ================================================================
+from tqdm import tqdm
+
 if __name__ == "__main__":
-    input_path  = r"C:\tk\迅雷云盘\原"
-    lang_type = "JP"
-    base_folder = os.path.dirname(input_path) if os.path.isfile(input_path) else input_path
-    
-    # 定义核心目录（物理锚点）
-    work_dir = Path(base_folder) / "manga_translator_work"
-    originals_dir = work_dir / "originals"
-    json_dir = work_dir / "json"
-    rendered_output_dir = Path(base_folder) / "rendered_results"
-    run_mtu_command(input_path, lang_type)
-    translate_pipeline(str(originals_dir), lang_type)
-     # 翻译完所有的 txt 之后，开始修 JSON,解决超分后json识别框参数超过范围
-    for json_file in json_dir.glob("*.json"):
-        fix_and_scale_json(str(json_file))
-    run_render_stage(input_path, output_path=str(rendered_output_dir))
-# 调用测试
+    # 采用普通的 for 循环，确保一本漫画跑完再跑下一本
+    # 这保证了 LLM 翻译时，你的 Python 脚本只会在一个时间点发一个请求给 LLM
+    all_paths = ["指定文件夹"]
+    lang = "JP"
+    BGE_MODEL_PATH = r"C:\pythonProject\manga-translator-ui-main\models\bge-m3"
+    bge_model = SentenceTransformer(BGE_MODEL_PATH, device='cpu')
+    memory = MangaMemory(model=bge_model, root_dir=PROJECT_ROOT / "tran_memory")
+    err_files = []
+    for path_str in tqdm(all_paths, desc="总体进度"):
+        input_path = Path(path_str).resolve()
+        # 1. OCR 阶段：这一步会调用我们破解后的 MTU
+        # 它会利用内部多线程（asyncio）飞速完成 57 张图的 OCR
+        # 由于是单进程，显存非常安全
+        run_mtu_command(input_path, lang)
 
-
+        # 2. 翻译阶段：在 OCR 全部写完硬盘后，进入单线程翻译
+        # 你的 translate_pipeline 内部是按顺序读 TXT 的，不会有任何幻觉干扰
+        work_dir = input_path / "manga_translator_work"
+        originals_dir = work_dir / "originals"
+        try:
+            rendered_results = input_path / "成品"
+            if originals_dir.exists():
+                translate_pipeline(originals_dir, lang, memory=memory)
+        except subprocess.CalledProcessError as e:
+            log_print(f"❌ {input_path.name} 渲染过程中进程崩溃 (Error {e.returncode})。")
+            log_print(f"💡 可能是图片尺寸过大或字体渲染冲突，已跳过此项目。")
+            err_files.append(input_path)
+        except Exception as e:
+            log_print(f"❌ {input_path.name} 发生未知错误: {e}")
+            err_files.append(input_path)
+        json_dir = work_dir / "json"
+        for jf in json_dir.glob("*.json"):
+            fix_and_scale_json(jf)
+        # 3. 渲染阶段
+        run_render_stage(input_path, rendered_results)
+    faiss.write_index(memory.index, str(memory.index_path))
+    log_print(f"✅ 所有项目处理完成，共 {len(all_paths)} 个，其中 {len(err_files)} 个项目处理失败。")
+    log_print(f"❌ 失败项目列表: {err_files}")
+   
