@@ -9,7 +9,10 @@ import json
 import numpy as np
 from pathlib import Path
 from datetime import datetime
+import warnings
+import traceback
 
+warnings.filterwarnings("ignore")
 
 # ================================================================
 # 1. 物理路径锁定 (确保脚本在任何地方运行都能找到配置文件)
@@ -74,8 +77,13 @@ import re
 import numpy as np
 from pathlib import Path
 class MangaSentinel:
+    _shared_model = None
     def __init__(self, regions, model_path=r'C:\pythonProject\manga-translator-ui-main\manga_xgb.txt'):
         # 1. 严格锁定 BorutaShap 筛选后的 16 个特征顺序
+        if MangaSentinel._shared_model is None:
+            log_print("🏠 加载全局 XGBoost 审计模型...")
+            MangaSentinel._shared_model = xgb.Booster()
+            MangaSentinel._shared_model.load_model(str(model_path))
         self.feature_names = [
             'font_size_to_max_ratio', 'hira_ratio', 'punct_ratio', 'norm_y', 
             'size_prob_prod', 'digit_ratio', 'kata_ratio', 'color_diff', 
@@ -84,8 +92,7 @@ class MangaSentinel:
         ]
         
         # 2. 加载模型
-        self.model = xgb.Booster()
-        self.model.load_model(str(model_path))
+        self.model = MangaSentinel._shared_model
         
         # 3. 预计算当前页面的统计基准（消除拍脑袋阈值）
         self.pg_stats = self._calc_page_stats(regions)
@@ -288,7 +295,35 @@ class MangaMemory:
         # 4. 定期持久化索引 (由于 HNSW 写入很快，可以每 100 条写一次)
         if idx_id % 100 == 0:
             faiss.write_index(self.index, str(self.index_path))
-
+    def batch_search_and_prepare(self, query_texts, threshold=0.85):
+        if not query_texts: return []
+        norm_queries = [self._normalize(t) for t in query_texts]
+        # 批量编码 (这是提速核心)
+        query_vecs = self.model.encode(norm_queries, normalize_embeddings=True)
+        
+        results = []
+        for i, vec in enumerate(query_vecs):
+            # --- 核心修复：强制转回 2D 形状 [1, 1024] ---
+            # 这样 add_memory 里的 self.index.add 就不再报 unpack 错误
+            vec_2d = vec.reshape(1, -1)
+            
+            if self.index.ntotal == 0:
+                results.append(("", 0.0, vec_2d))
+                continue
+            
+            # 使用 2D 向量进行检索
+            distances, indices = self.index.search(vec_2d.astype('float32'), 3)
+            best_score = distances[0][0] if len(distances[0]) > 0 else 0
+            
+            refs = []
+            for dist, idx in zip(distances[0], indices[0]):
+                if idx != -1 and dist > threshold:
+                    item = self.data_store[idx]
+                    refs.append(f"原文: {item['orig']} -> 译文: {item['trans']}")
+            
+            context = "\n".join(refs) if refs else ""
+            results.append((context, best_score, vec_2d))
+        return results
 def safe_clean_line(translated, original):
     """
     高级防护清洗：
@@ -465,12 +500,11 @@ def translate_pipeline(target_dir, lang_type="JP", memory=None, max_lines=10, ch
     json_dir = work_dir / "json" 
     params = json.load(open(PARAM_JSON, 'r'))['translator'] if PARAM_JSON.exists() else {}
     prompt_map = {
-    "JP": "prompt_jp_sakura.yaml",
-    "EN": "prompt_en.yaml",
-    "CN": "prompt_cn.yaml",
-}
+        "JP": "prompt_jp_sakura.yaml",
+        "EN": "prompt_en.yaml",
+        "CN": "prompt_cn.yaml",
+    }
     prompt_file = prompt_map.get(lang_type.upper(), "prompt_cn.yaml")
-    log_print("🚀 正在加载 BGE-M3 语义记忆模型...")
 
     with open(CONFIG_DIR / prompt_file, 'r', encoding='utf-8') as f:
         sys_prompt = yaml.safe_load(f)['system_prompt'].replace('{target_language}', '简体中文').replace('{{{target_lang}}}', '简体中文')
@@ -485,13 +519,12 @@ def translate_pipeline(target_dir, lang_type="JP", memory=None, max_lines=10, ch
         meta_map = {}
         json_filename = txt_file.name.replace("_original.txt", "_translations.json")
         json_meta_path = json_dir / json_filename
-        # 存储这一页中第几个 region 是噪音，例如 {0, 3, 5}
         purge_indices = set() 
         all_regions = []
         upscale, pg_w, pg_h = 1, 1, 1
         if json_meta_path.exists():
             try:
-                with open(json_meta_path, 'r', encoding='utf-8') as jf:
+                with open(json_meta_path, 'r', encoding='utf-8-sig') as jf:
                     m_data = json.load(jf)
                     img_node = m_data[list(m_data.keys())[0]]
                     all_regions = img_node.get('regions', [])
@@ -508,40 +541,29 @@ def translate_pipeline(target_dir, lang_type="JP", memory=None, max_lines=10, ch
         try:
             with open(txt_file, 'r', encoding='utf-8') as f:
                 content = f.read().strip()
-                
             if not content:
                 log_print(f"⏩ 跳过空文件: {txt_file.name}")
                 continue
-                
-            # 注意这里是 loads (带s)，解析刚才读出来的 content 字符串
             data = json.loads(content)
-            
         except json.JSONDecodeError as e:
-            log_print(f"❌ 文件 {txt_file.name} 内容不是合法的 JSON (可能含有非法反斜杠或残缺): {e}")
-            log_print(f"💡 跳过此文件，继续处理下一个...")
+            log_print(f"❌ 文件 {txt_file.name} 内容不是合法的 JSON: {e}")
             continue
         except Exception as e:
             log_print(f"❌ 读取 {txt_file.name} 发生未知错误: {e}")
             continue
+
         sentinel = MangaSentinel(all_regions)
         items = list(data.items())
         full_translated_page = {}
         valid_items_to_send = []
-        # 建立一个记录“哪些 Region ID 需要被物理删除”的集合
         regions_to_purge = set()
         for idx, reg in enumerate(all_regions):
-            # 获取该 region 对应的 texts（可能是多行）
             texts_list = reg.get('texts', [])
-            is_noise_region = False
-            
-            # 使用模型判定
             if lang_type != "CN":
                 is_noise, p_val = sentinel.predict_is_noise(reg, upscale, pg_w, pg_h)
-                
                 if is_noise:
                     purge_indices.add(idx)
                     regions_to_purge.add(id(reg))
-                    # 记录这块区域下所有的 texts 都标记为不翻译
                     for t in texts_list:
                         full_translated_page[str(t).strip()] = str(t)
                     log_print(f"   🚫 [XGB旁路] Prob={p_val:.4f} | 内容='{reg.get('text')[:10]}'")
@@ -549,11 +571,11 @@ def translate_pipeline(target_dir, lang_type="JP", memory=None, max_lines=10, ch
         for real_key, val in items:
             t_key = str(real_key).strip()
             reg_meta = meta_map.get(t_key)
-            # 如果该行所属的 Region 在拦截名单里
             if reg_meta and id(reg_meta) in regions_to_purge:
-                full_translated_page[real_key] = real_key # 回填原文
+                full_translated_page[real_key] = real_key 
             else:
-                valid_items_to_send.append((real_key, val)) # 只有这里才是 LLM
+                valid_items_to_send.append((real_key, val))
+
         # 2. 动态切块翻译
         chunks = []
         temp_chunk = []
@@ -568,29 +590,26 @@ def translate_pipeline(target_dir, lang_type="JP", memory=None, max_lines=10, ch
             if temp_chunk: chunks.append(temp_chunk)
 
         # 跑 API 翻译
-        # 跑 API 翻译
         if lang_type != "CN":
             for raw_chunk in chunks:
                 # ================================================================
-                # 调用位置 A: 检索增强 (RAG Prepare)
+                # 回退：逐行查询记忆库 (最原始且稳健的逻辑)
                 # ================================================================
                 raw_refs = []
-                chunk_rag_info = {} # 用于暂存向量，防止重复计算
+                chunk_rag_info = {} 
                 
                 for idx, (real_key, original_val) in enumerate(raw_chunk):
-                    # 修改 search_and_prepare，让它只返回具体的 "原文 -> 译文" 对，不要带标题
-                    # 或者在这里手动处理字符串
+                    # 修改 search_and_prepare，让它只返回具体的 "原文 -> 译文" 对
                     context, score, vec = memory.search_and_prepare(original_val)
                     if context:
-                        # 提取具体的 "原文: ... -> 译文: ..." 部分
-                        clean_ref = context.replace("[参考记忆]:", "").strip()
-                        raw_refs.append(clean_ref)
+                        raw_refs.append(context)
+                    # 存入中转站，供后续写入记忆库使用
                     chunk_rag_info[str(idx+1)] = {"vec": vec, "score": score}
                 
-                # 合并成一个整洁的参考块
+                # 合并成一个参考块
                 if raw_refs:
                     unique_refs = list(set(raw_refs))
-                    rag_prompt_addition = "\n\n【相关历史译文参考】:\n" + "\n".join(unique_refs)
+                    rag_prompt_addition = "\n" + "\n".join(unique_refs)
                 else:
                     rag_prompt_addition = ""
                 
@@ -603,7 +622,6 @@ def translate_pipeline(target_dir, lang_type="JP", memory=None, max_lines=10, ch
                 line_rules = []
                 line_refs = []
                 for i in range(1, expected_count + 1):
-                    # 关键：严格限制每行开头为【序号】，中间非换行，结尾必须换行
                     line_rules.append(f'line{i} ::= "【{i}】" [^\\n]+ "\\n"')
                     line_refs.append(f"line{i}")
                 
@@ -611,14 +629,13 @@ def translate_pipeline(target_dir, lang_type="JP", memory=None, max_lines=10, ch
                 gbnf_rules.extend(line_rules)
                 gbnf_code = "\n".join(gbnf_rules) 
                 try:
-                    # 每一块都是独立请求，防止 Session 污染
                     payload = {
                         "model": "local-model",
                         "messages": [
-                            {"role": "system", "content": current_sys_prompt}, # 使用 RAG 增强后的提示词
+                            {"role": "system", "content": current_sys_prompt},
                             {"role": "user", "content": v_input}
                         ],
-                        "grammar": gbnf_code,  # 核心：物理锁死格式
+                        "grammar": gbnf_code,
                         "stop": ["</textarea>","<|im_end|>","<|endoftext|>"],
                         **params
                     }
@@ -627,22 +644,17 @@ def translate_pipeline(target_dir, lang_type="JP", memory=None, max_lines=10, ch
                     log_llm_transaction(llm_log_path, txt_file.name, payload, r)
                     
                     raw_response = r['choices'][0]['message']['content']
-                    # 解析虚拟 ID 的结果
                     v_trans_res = parse_textarea_output(raw_response, list(v_chunk_data.keys()), v_chunk_data)
                     
-                    # 核心：通过索引 idx 将虚拟 ID 映射回真正的原始 Key
                     for idx, (real_key, original_val) in enumerate(raw_chunk):
                         v_id = str(idx + 1)
                         translated_text = v_trans_res.get(v_id, original_val)
-                        
-                        # 得到最终清洗后的译文
                         final_trans = clean_translation_prefix(translated_text, v_id)
                         full_translated_page[real_key] = final_trans
                         
                         # ================================================================
-                        # 调用位置 B: 增量写入记忆库 (RAG Store)
+                        # 回退：写入记忆库
                         # ================================================================
-                        # 只有翻译成功（不为空且不等于原文）才写入
                         if final_trans and final_trans != original_val:
                             info = chunk_rag_info.get(v_id)
                             if info:
@@ -662,15 +674,12 @@ def translate_pipeline(target_dir, lang_type="JP", memory=None, max_lines=10, ch
             for raw_chunk in chunks:
                 for r_key, r_val in raw_chunk:      
                     full_translated_page[r_key] = r_val
+                    
         # 记录汇总并写回文件
         log_tran_summary(tran_log_path, txt_file.name, full_translated_page)
         with open(txt_file, 'w', encoding='utf-8') as f:
             json.dump(full_translated_page, f, ensure_ascii=False, indent=4)
         log_print(f"✅ {txt_file.name} 翻译成功并回写")
-         # 5. --- [核心调用：物理切除 JSON 噪音并重置蒙版] ---
-
-
-# ================================================================
 # 4. MTU 与坐标修复 (保持稳定版逻辑)
 # ================================================================
 
@@ -734,8 +743,8 @@ from tqdm import tqdm
 if __name__ == "__main__":
     # 采用普通的 for 循环，确保一本漫画跑完再跑下一本
     # 这保证了 LLM 翻译时，你的 Python 脚本只会在一个时间点发一个请求给 LLM
-    all_paths = ["指定文件夹"]
-    lang = "JP"
+    all_paths = [r'C:\tk\迅雷下载\test']
+    lang = "EN"
     BGE_MODEL_PATH = r"C:\pythonProject\manga-translator-ui-main\models\bge-m3"
     bge_model = SentenceTransformer(BGE_MODEL_PATH, device='cpu')
     memory = MangaMemory(model=bge_model, root_dir=PROJECT_ROOT / "tran_memory")
@@ -751,22 +760,24 @@ if __name__ == "__main__":
         # 你的 translate_pipeline 内部是按顺序读 TXT 的，不会有任何幻觉干扰
         work_dir = input_path / "manga_translator_work"
         originals_dir = work_dir / "originals"
-        try:
-            rendered_results = input_path / "成品"
-            if originals_dir.exists():
-                translate_pipeline(originals_dir, lang, memory=memory)
-        except subprocess.CalledProcessError as e:
-            log_print(f"❌ {input_path.name} 渲染过程中进程崩溃 (Error {e.returncode})。")
-            log_print(f"💡 可能是图片尺寸过大或字体渲染冲突，已跳过此项目。")
-            err_files.append(input_path)
-        except Exception as e:
-            log_print(f"❌ {input_path.name} 发生未知错误: {e}")
-            err_files.append(input_path)
+
+        rendered_results = input_path / "成品"
+        if originals_dir.exists():
+            translate_pipeline(originals_dir, lang, memory=memory)
+        
         json_dir = work_dir / "json"
         for jf in json_dir.glob("*.json"):
             fix_and_scale_json(jf)
         # 3. 渲染阶段
-        run_render_stage(input_path, rendered_results)
+        try:
+            run_render_stage(input_path, rendered_results)
+        except subprocess.CalledProcessError as e:
+            log_print(f"❌ {input_path.name} 渲染过程中进程崩溃 (Error {e.returncode})。")
+            log_print(f"trackback: {traceback.print_exc()}")
+            err_files.append(input_path)
+        except Exception as e:
+            log_print(f"❌ {input_path.name} 发生未知错误: {e}")
+            err_files.append(input_path)
     faiss.write_index(memory.index, str(memory.index_path))
     log_print(f"✅ 所有项目处理完成，共 {len(all_paths)} 个，其中 {len(err_files)} 个项目处理失败。")
     log_print(f"❌ 失败项目列表: {err_files}")
